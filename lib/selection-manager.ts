@@ -45,6 +45,10 @@ export class SelectionManager {
   private isSelecting: boolean = false;
   private mouseDownTarget: EventTarget | null = null; // Track where mousedown occurred
 
+  // Mouse reporting state - track button state for motion events
+  // Using Set to handle multi-button scenarios (e.g., holding left while pressing right)
+  private mouseButtonsPressed: Set<number> = new Set();
+
   // Track rows that need redraw for clearing old selection
   // Using a Set prevents the overwrite bug where mousemove would clobber
   // the rows marked by clearSelection()
@@ -180,7 +184,12 @@ export class SelectionManager {
           if (char.trim()) {
             lastNonEmpty = lineText.length;
           }
-        } else {
+        } else if (!cell || cell.width !== 0) {
+          // Only add space for truly empty cells, not wide character continuation cells.
+          // Wide characters (like CJK) occupy 2 terminal cells:
+          // - First cell: has codepoint, width=2
+          // - Second cell: codepoint=0, width=0 (continuation marker)
+          // We skip continuation cells to avoid inserting spaces between characters.
           lineText += ' ';
         }
       }
@@ -209,11 +218,11 @@ export class SelectionManager {
   hasSelection(): boolean {
     if (!this.selectionStart || !this.selectionEnd) return false;
 
-    // Check if start and end are the same (single cell, no real selection)
-    return !(
-      this.selectionStart.col === this.selectionEnd.col &&
-      this.selectionStart.absoluteRow === this.selectionEnd.absoluteRow
-    );
+    // Same start and end means no real selection
+    // Note: click-without-drag clears same-cell in mouseup handler,
+    // so any same-cell selection here is programmatic (e.g., triple-click single-char)
+    // which IS a valid selection
+    return true;
   }
 
   /**
@@ -424,25 +433,151 @@ export class SelectionManager {
   // Private Methods
   // ==========================================================================
 
+  // ==========================================================================
+  // Mouse Reporting (SGR format)
+  // ==========================================================================
+
+  /**
+   * Check if SGR mouse format (DEC mode 1006) is enabled.
+   * When 1006 is not enabled, applications expect X10 format which we don't yet support.
+   * Returns true if SGR mode is enabled, false otherwise.
+   */
+  private hasSGRMouseMode(): boolean {
+    const wasmTerm = (this.terminal as any).wasmTerm;
+    if (!wasmTerm) return false;
+    return wasmTerm.getMode(1006, false);
+  }
+
+  /**
+   * Check if motion events should be reported based on tracking mode.
+   * - Mode 1000 (NORMAL): Only button press/release, no motion
+   * - Mode 1002 (BUTTON): Motion only while button is held
+   * - Mode 1003 (ANY): All motion events
+   */
+  private shouldReportMotion(buttonHeld: boolean): boolean {
+    const wasmTerm = (this.terminal as any).wasmTerm;
+    if (!wasmTerm) return false;
+
+    // Mode 1003 (any-event tracking) reports all motion
+    if (wasmTerm.getMode(1003, false)) return true;
+
+    // Mode 1002 (button-event tracking) reports motion only with button held
+    if (wasmTerm.getMode(1002, false) && buttonHeld) return true;
+
+    // Mode 1000 (normal tracking) does not report motion
+    return false;
+  }
+
+  /**
+   * Map browser button codes to SGR button codes.
+   * Only buttons 0, 1, 2 are valid; others return null.
+   */
+  private mapButton(browserButton: number): number | null {
+    // Browser: 0=left, 1=middle, 2=right, 3+=auxiliary
+    // SGR: 0=left, 1=middle, 2=right
+    if (browserButton >= 0 && browserButton <= 2) {
+      return browserButton;
+    }
+    return null; // Ignore auxiliary buttons (3+)
+  }
+
+  /**
+   * Encode modifier keys into button code.
+   * Shift: +4, Alt/Meta: +8, Ctrl: +16
+   */
+  private encodeModifiers(e: MouseEvent | WheelEvent): number {
+    let modifiers = 0;
+    if (e.shiftKey) modifiers += 4;
+    if (e.altKey || e.metaKey) modifiers += 8;
+    if (e.ctrlKey) modifiers += 16;
+    return modifiers;
+  }
+
+  /**
+   * Generate SGR mouse sequence and send to terminal.
+   * SGR format: CSI < button ; col ; row M (press) or m (release)
+   * Button code includes: base button (0-2) + motion flag (32) + modifiers (4/8/16) + scroll (64/65)
+   *
+   * Only sends if DEC mode 1006 (SGR) is enabled. Without 1006, applications expect
+   * X10 format which encodes differently and has coordinate limits.
+   */
+  private sendMouseEvent(
+    col: number,
+    row: number,
+    button: number,
+    isRelease: boolean,
+    modifiers: number = 0,
+    isMotion: boolean = false
+  ): void {
+    // Only emit SGR sequences if mode 1006 is enabled
+    // Without 1006, apps expect X10 format (not yet implemented)
+    if (!this.hasSGRMouseMode()) {
+      return;
+    }
+
+    // SGR mouse uses 1-based coordinates
+    const x = col + 1;
+    const y = row + 1;
+
+    // Build button code:
+    // - Base: 0=left, 1=middle, 2=right, 64=scroll-up, 65=scroll-down
+    // - Motion flag: +32 when reporting motion
+    // - Modifiers: +4=shift, +8=alt/meta, +16=ctrl
+    let buttonCode = button;
+    if (isMotion) {
+      buttonCode += 32;
+    }
+    buttonCode += modifiers;
+
+    // SGR format: \x1b[<buttonCode;x;yM (press) or \x1b[<buttonCode;x;ym (release)
+    const suffix = isRelease ? 'm' : 'M';
+    const sequence = `\x1b[<${buttonCode};${x};${y}${suffix}`;
+
+    // Send via terminal's data emitter (goes to PTY)
+    (this.terminal as any).dataEmitter?.fire(sequence);
+  }
+
+  /**
+   * Send scroll wheel event with modifiers.
+   */
+  private sendScrollEvent(col: number, row: number, isUp: boolean, modifiers: number = 0): void {
+    // Scroll wheel: button 64 = up, 65 = down
+    const button = isUp ? 64 : 65;
+    this.sendMouseEvent(col, row, button, false, modifiers, false);
+  }
+
   /**
    * Attach mouse event listeners to canvas
    */
   private attachEventListeners(): void {
     const canvas = this.renderer.getCanvas();
 
-    // Mouse down - start selection or clear existing
+    // Mouse down - start selection or send mouse event to application
     canvas.addEventListener('mousedown', (e: MouseEvent) => {
+      // CRITICAL: Focus the terminal so it can receive keyboard input
+      // The canvas doesn't have tabindex, but the parent container does
+      if (canvas.parentElement) {
+        canvas.parentElement.focus();
+      }
+
+      const cell = this.pixelToCell(e.offsetX, e.offsetY);
+
+      // Check if an application has enabled mouse tracking
+      if (this.terminal.hasMouseTracking()) {
+        // Map browser button to SGR button (ignore auxiliary buttons 3+)
+        const sgrButton = this.mapButton(e.button);
+        if (sgrButton === null) return; // Ignore unsupported buttons
+
+        // Track this button as pressed (supports multi-button scenarios)
+        this.mouseButtonsPressed.add(sgrButton);
+        const modifiers = this.encodeModifiers(e);
+        this.sendMouseEvent(cell.col, cell.row, sgrButton, false, modifiers);
+        e.preventDefault(); // Prevent text selection
+        return;
+      }
+
+      // Normal selection behavior (left click only)
       if (e.button === 0) {
-        // Left click only
-
-        // CRITICAL: Focus the terminal so it can receive keyboard input
-        // The canvas doesn't have tabindex, but the parent container does
-        if (canvas.parentElement) {
-          canvas.parentElement.focus();
-        }
-
-        const cell = this.pixelToCell(e.offsetX, e.offsetY);
-
         // Always clear previous selection on new click
         const hadSelection = this.hasSelection();
         if (hadSelection) {
@@ -457,8 +592,24 @@ export class SelectionManager {
       }
     });
 
-    // Mouse move on canvas - update selection
+    // Mouse move on canvas - update selection or send motion events
     canvas.addEventListener('mousemove', (e: MouseEvent) => {
+      // Check if motion events should be reported based on tracking mode
+      if (this.terminal.hasMouseTracking()) {
+        const buttonHeld = this.mouseButtonsPressed.size > 0;
+        if (this.shouldReportMotion(buttonHeld)) {
+          const cell = this.pixelToCell(e.offsetX, e.offsetY);
+          const modifiers = this.encodeModifiers(e);
+          // Use the first held button for motion, or button 3 (no button) if none held
+          // In SGR, motion with button uses 32 + button, motion without button uses 32 + 3
+          const button = buttonHeld ? [...this.mouseButtonsPressed][0] : 3;
+          this.sendMouseEvent(cell.col, cell.row, button, false, modifiers, true);
+          return;
+        }
+        // If mouse tracking but motion not reported, still prevent selection
+        if (buttonHeld) return;
+      }
+
       if (this.isSelecting) {
         // Mark current selection rows as dirty before updating
         this.markCurrentSelectionDirty();
@@ -546,9 +697,46 @@ export class SelectionManager {
     // CRITICAL FIX: Listen for mouseup on DOCUMENT, not just canvas
     // This catches mouseup events that happen outside the canvas (common during drag)
     this.boundMouseUpHandler = (e: MouseEvent) => {
+      // Handle mouse release for mouse tracking
+      // Use e.button directly to handle multi-button scenarios correctly
+      const sgrButton = this.mapButton(e.button);
+      if (
+        sgrButton !== null &&
+        this.mouseButtonsPressed.has(sgrButton) &&
+        this.terminal.hasMouseTracking()
+      ) {
+        const rect = canvas.getBoundingClientRect();
+        // Calculate cell from event position (clamped to canvas bounds)
+        const clampedX = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+        const clampedY = Math.max(0, Math.min(e.clientY - rect.top, rect.height));
+        const cell = this.pixelToCell(clampedX, clampedY);
+        const modifiers = this.encodeModifiers(e);
+        this.sendMouseEvent(cell.col, cell.row, sgrButton, true, modifiers);
+        this.mouseButtonsPressed.delete(sgrButton);
+        return;
+      }
+      // Clean up button tracking even if mouse tracking is not enabled
+      if (sgrButton !== null) {
+        this.mouseButtonsPressed.delete(sgrButton);
+      }
+
       if (this.isSelecting) {
         this.isSelecting = false;
         this.stopAutoScroll();
+
+        // Check if this was a click without drag (start == end)
+        // If so, clear the selection - a click shouldn't create a selection
+        if (
+          this.selectionStart &&
+          this.selectionEnd &&
+          this.selectionStart.col === this.selectionEnd.col &&
+          this.selectionStart.absoluteRow === this.selectionEnd.absoluteRow
+        ) {
+          // Clear same-cell selection from click-without-drag
+          this.selectionStart = null;
+          this.selectionEnd = null;
+          return;
+        }
 
         const text = this.getSelection();
         if (text) {
@@ -559,21 +747,67 @@ export class SelectionManager {
     };
     document.addEventListener('mouseup', this.boundMouseUpHandler);
 
-    // Double-click - select word
-    canvas.addEventListener('dblclick', (e: MouseEvent) => {
-      const cell = this.pixelToCell(e.offsetX, e.offsetY);
-      const word = this.getWordAtCell(cell.col, cell.row);
+    // Handle click events for double-click (word) and triple-click (line) selection
+    // Use event.detail which browsers set to click count (1, 2, 3, etc.)
+    canvas.addEventListener('click', (e: MouseEvent) => {
+      // event.detail: 1 = single, 2 = double, 3 = triple click
+      if (e.detail === 2) {
+        // Double-click - select word
+        const cell = this.pixelToCell(e.offsetX, e.offsetY);
+        const word = this.getWordAtCell(cell.col, cell.row);
 
-      if (word) {
+        if (word) {
+          const absoluteRow = this.viewportRowToAbsolute(cell.row);
+          this.selectionStart = { col: word.startCol, absoluteRow };
+          this.selectionEnd = { col: word.endCol, absoluteRow };
+          this.requestRender();
+
+          const text = this.getSelection();
+          if (text) {
+            this.copyToClipboard(text);
+            this.selectionChangedEmitter.fire();
+          }
+        }
+      } else if (e.detail >= 3) {
+        // Triple-click (or more) - select line content (like native Ghostty)
+        const cell = this.pixelToCell(e.offsetX, e.offsetY);
         const absoluteRow = this.viewportRowToAbsolute(cell.row);
-        this.selectionStart = { col: word.startCol, absoluteRow };
-        this.selectionEnd = { col: word.endCol, absoluteRow };
-        this.requestRender();
 
-        const text = this.getSelection();
-        if (text) {
-          this.copyToClipboard(text);
-          this.selectionChangedEmitter.fire();
+        // Find actual line length (exclude trailing empty cells)
+        // Use scrollback-aware line retrieval (like getSelection does)
+        const scrollbackLength = this.wasmTerm.getScrollbackLength();
+        let line: GhosttyCell[] | null = null;
+        if (absoluteRow < scrollbackLength) {
+          // Row is in scrollback
+          line = this.wasmTerm.getScrollbackLine(absoluteRow);
+        } else {
+          // Row is in screen buffer
+          const screenRow = absoluteRow - scrollbackLength;
+          line = this.wasmTerm.getLine(screenRow);
+        }
+        // Find last non-empty cell (-1 means empty line)
+        let endCol = -1;
+        if (line) {
+          for (let i = line.length - 1; i >= 0; i--) {
+            if (line[i] && line[i].codepoint !== 0 && line[i].codepoint !== 32) {
+              endCol = i;
+              break;
+            }
+          }
+        }
+
+        // Only select if line has content (endCol >= 0)
+        if (endCol >= 0) {
+          // Select line content only (not trailing whitespace)
+          this.selectionStart = { col: 0, absoluteRow };
+          this.selectionEnd = { col: endCol, absoluteRow };
+          this.requestRender();
+
+          const text = this.getSelection();
+          if (text) {
+            this.copyToClipboard(text);
+            this.selectionChangedEmitter.fire();
+          }
         }
       }
     });
@@ -581,6 +815,12 @@ export class SelectionManager {
     // Right-click (context menu) - position textarea to show browser's native menu
     // This allows Copy/Paste options to appear in the context menu
     this.boundContextMenuHandler = (e: MouseEvent) => {
+      // When mouse tracking is enabled, suppress context menu - right-click goes to app
+      if (this.terminal.hasMouseTracking()) {
+        e.preventDefault();
+        return;
+      }
+
       // Position textarea at mouse cursor
       const canvas = this.renderer.getCanvas();
       const rect = canvas.getBoundingClientRect();
@@ -829,11 +1069,13 @@ export class SelectionManager {
     const line = this.wasmTerm.getLine(row);
     if (!line) return null;
 
-    // Word characters: letters, numbers, underscore, dash
+    // Word characters: letters, numbers, and common path/URL characters
+    // Matches native Ghostty behavior where double-click selects entire paths
+    // Includes: / (path sep), . (extensions), ~ (home), : (line numbers), @ (emails)
     const isWordChar = (cell: GhosttyCell) => {
       if (!cell || cell.codepoint === 0) return false;
       const char = String.fromCodePoint(cell.codepoint);
-      return /[\w-]/.test(char);
+      return /[\w\-./~:@+]/.test(char);
     };
 
     // Only return if we're actually on a word character
@@ -864,6 +1106,12 @@ export class SelectionManager {
    * 3. Fall back to execCommand (legacy, for older browsers)
    */
   private copyToClipboard(text: string): void {
+    // Defensive check: don't copy empty text or if no selection
+    // This prevents accidental clipboard overwrites from single clicks
+    if (!text || !this.hasSelection()) {
+      return;
+    }
+
     // First try: ClipboardItem API (modern, Safari-compatible)
     // Safari allows this because we create the ClipboardItem synchronously
     // within the user gesture, even though the write is async

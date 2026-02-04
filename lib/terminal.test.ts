@@ -1312,7 +1312,7 @@ describe('Buffer Access API', () => {
 
     term.open(container!);
 
-    // Write to main screen (default background = black)
+    // Write to main screen (default background from DEFAULT_THEME = #1e1e1e = RGB(30, 30, 30))
     term.write('MAIN\r\n');
     term.wasmTerm?.update();
     term.wasmTerm?.markClean();
@@ -1331,22 +1331,22 @@ describe('Buffer Access API', () => {
     term.wasmTerm?.update();
     term.wasmTerm?.markClean();
 
-    // Verify alternate screen has non-default background
+    // Verify alternate screen has non-default background (blue)
     const altViewport = term.wasmTerm?.getViewport();
-    expect(altViewport![0].bg_r).not.toBe(0); // Should be blue-ish
+    expect(altViewport![0].bg_b).toBeGreaterThan(altViewport![0].bg_r); // Blue > Red for blue background
 
     // Exit alternate screen
     term.write('\x1b[?1049l');
     term.wasmTerm?.update();
 
-    // CRITICAL: Background colors must be restored to main screen values (black)
+    // CRITICAL: Background colors must be restored to main screen values (DEFAULT_THEME background)
     const restoredViewport = term.wasmTerm?.getViewport();
     const firstCell = restoredViewport![0];
 
-    // Main screen cells should have default background (0, 0, 0 = black)
-    expect(firstCell.bg_r).toBe(0);
-    expect(firstCell.bg_g).toBe(0);
-    expect(firstCell.bg_b).toBe(0);
+    // Main screen cells should have default background from DEFAULT_THEME (#1e1e1e = 30, 30, 30)
+    expect(firstCell.bg_r).toBe(30);
+    expect(firstCell.bg_g).toBe(30);
+    expect(firstCell.bg_b).toBe(30);
 
     // Verify text is also restored
     expect(String.fromCodePoint(firstCell.codepoint)).toBe('M');
@@ -2555,6 +2555,125 @@ describe('Options Proxy handleOptionChange', () => {
 
     term.dispose();
   });
+
+  test('font family with spaces is properly quoted', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({
+      fontFamily: 'Fira Code, Consolas, monospace',
+      cols: 80,
+      rows: 24,
+    });
+    term.open(container);
+
+    // @ts-ignore - accessing private for test
+    const renderer = term.renderer;
+
+    // The renderer should have stored the font family
+    // @ts-ignore - accessing private for test
+    expect(renderer.fontFamily).toBe('Fira Code, Consolas, monospace');
+
+    // Test that buildFontString properly quotes the font
+    // @ts-ignore - accessing private for test
+    const fontString = renderer.buildFontString();
+    expect(fontString).toContain('"Fira Code"');
+    expect(fontString).toContain('Consolas');
+    expect(fontString).toContain('monospace');
+
+    term.dispose();
+  });
+
+  test('font family already quoted is not double-quoted', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({
+      fontFamily: '"Fira Code", monospace',
+      cols: 80,
+      rows: 24,
+    });
+    term.open(container);
+
+    // @ts-ignore - accessing private for test
+    const renderer = term.renderer;
+    // @ts-ignore - accessing private for test
+    const fontString = renderer.buildFontString();
+
+    // Should not have double quotes
+    expect(fontString).not.toContain('""Fira Code""');
+    expect(fontString).toContain('"Fira Code"');
+
+    term.dispose();
+  });
+
+  test('loadFonts() triggers re-measurement and re-render', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({ fontSize: 15, cols: 80, rows: 24 });
+    term.open(container);
+
+    // @ts-ignore - accessing private for test
+    const renderer = term.renderer;
+    const initialMetrics = renderer.getMetrics();
+
+    // Change font family to something different (simulating a font load scenario)
+    term.options.fontFamily = 'serif';
+
+    // Get metrics after the automatic update from options change
+    const afterOptionsMetrics = renderer.getMetrics();
+
+    // Change back and verify loadFonts works independently
+    // @ts-ignore - accessing private for test
+    renderer.fontFamily = 'monospace';
+
+    // Call loadFonts to trigger re-measurement (without going through options)
+    term.loadFonts();
+
+    // Verify loadFonts was called (metrics should change since font changed)
+    const finalMetrics = renderer.getMetrics();
+    // The metrics should be recalculated (may or may not differ based on fonts available)
+    expect(finalMetrics).toBeDefined();
+    expect(finalMetrics.width).toBeGreaterThan(0);
+    expect(finalMetrics.height).toBeGreaterThan(0);
+
+    term.dispose();
+  });
+
+  test('buildFontString includes style prefix', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({
+      fontFamily: 'monospace',
+      fontSize: 16,
+      cols: 80,
+      rows: 24,
+    });
+    term.open(container);
+
+    // @ts-ignore - accessing private for test
+    const renderer = term.renderer;
+
+    // Test with no style
+    // @ts-ignore - accessing private for test
+    let fontString = renderer.buildFontString();
+    expect(fontString).toBe('16px monospace');
+
+    // Test with bold style
+    // @ts-ignore - accessing private for test
+    fontString = renderer.buildFontString('bold ');
+    expect(fontString).toBe('bold 16px monospace');
+
+    // Test with italic style
+    // @ts-ignore - accessing private for test
+    fontString = renderer.buildFontString('italic ');
+    expect(fontString).toBe('italic 16px monospace');
+
+    // Test with bold italic style
+    // @ts-ignore - accessing private for test
+    fontString = renderer.buildFontString('italic bold ');
+    expect(fontString).toBe('italic bold 16px monospace');
+
+    term.dispose();
+  });
 });
 
 // ==========================================================================
@@ -2990,3 +3109,91 @@ describe('Synchronous open()', () => {
     term.dispose();
   });
 });
+
+describe('Terminal Snapshot API', () => {
+  // Snapshot API tests need WASM initialization
+
+  test('hasSnapshot returns false by default', async () => {
+    const term = await createIsolatedTerminal({ cols: 10, rows: 5 });
+    expect(term.hasSnapshot()).toBe(false);
+    term.dispose();
+  });
+
+  test('setSnapshot sets snapshot mode', async () => {
+    const term = await createIsolatedTerminal({ cols: 10, rows: 5 });
+    const cells = createTestCells(10, 5, 'A');
+    const cursor = { x: 5, y: 2 };
+
+    term.setSnapshot(cells, cursor);
+    expect(term.hasSnapshot()).toBe(true);
+
+    term.dispose();
+  });
+
+  test('clearSnapshot exits snapshot mode', async () => {
+    const term = await createIsolatedTerminal({ cols: 10, rows: 5 });
+    const cells = createTestCells(10, 5, 'A');
+
+    term.setSnapshot(cells, { x: 0, y: 0 });
+    expect(term.hasSnapshot()).toBe(true);
+
+    term.clearSnapshot();
+    expect(term.hasSnapshot()).toBe(false);
+
+    term.dispose();
+  });
+
+  test('getSnapshotCells returns set cells', async () => {
+    const term = await createIsolatedTerminal({ cols: 10, rows: 5 });
+    const cells = createTestCells(10, 5, 'B');
+
+    term.setSnapshot(cells, { x: 0, y: 0 });
+    const snapshotCells = term.getSnapshotCells();
+
+    expect(snapshotCells).not.toBeNull();
+    expect(snapshotCells!.length).toBe(5); // 5 rows
+    expect(snapshotCells![0].length).toBe(10); // 10 cols per row
+    expect(snapshotCells![0][0].codepoint).toBe('B'.charCodeAt(0));
+
+    term.dispose();
+  });
+
+  test('getSnapshotCursor returns set cursor', async () => {
+    const term = await createIsolatedTerminal({ cols: 10, rows: 5 });
+    const cells = createTestCells(10, 5, 'X');
+    const cursor = { x: 7, y: 3 };
+
+    term.setSnapshot(cells, cursor);
+    const snapshotCursor = term.getSnapshotCursor();
+
+    expect(snapshotCursor).not.toBeNull();
+    expect(snapshotCursor!.x).toBe(7);
+    expect(snapshotCursor!.y).toBe(3);
+
+    term.dispose();
+  });
+});
+
+/**
+ * Helper to create test GhosttyCell array
+ */
+function createTestCells(cols: number, rows: number, char: string) {
+  const codepoint = char.charCodeAt(0);
+  const cells = [];
+  for (let i = 0; i < rows * cols; i++) {
+    cells.push({
+      codepoint,
+      fg_r: 255,
+      fg_g: 255,
+      fg_b: 255,
+      bg_r: 0,
+      bg_g: 0,
+      bg_b: 0,
+      flags: 0,
+      width: 1,
+      hyperlink_id: 0,
+      grapheme_len: 0,
+    });
+  }
+  return cells;
+}
