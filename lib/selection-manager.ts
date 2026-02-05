@@ -733,8 +733,8 @@ export class SelectionManager {
           this.selectionStart.absoluteRow === this.selectionEnd.absoluteRow
         ) {
           // Clear same-cell selection from click-without-drag
-          this.selectionStart = null;
-          this.selectionEnd = null;
+          // Use clearSelection() to properly mark dirty rows for visual clearing
+          this.clearSelection();
           return;
         }
 
